@@ -11,7 +11,6 @@ from .context_assembler import (
     ApiContractContext,
     ArchitectureDiagramContext,
     ContextAssembler,
-    DiffSummaryContext,
     FilePageContext,
     InfraPageContext,
     ModulePageContext,
@@ -44,11 +43,36 @@ from .models import (
     compute_source_hash,
     decay_confidence,
 )
+from .api_contract_detector import detect_code_api_contracts
+from .interlinking import (
+    LinkIndex,
+    WikiLink,
+    attach_wiki_links_and_backlinks,
+    resolve_wiki_links,
+)
 from .page_generator import SYSTEM_PROMPTS, PageGenerator
+from .selection import (
+    BucketAllocation,
+    ModuleGroup,
+    Selection,
+    SelectionInputs,
+    select_pages,
+    summarize_selection,
+)
 
 __all__ = [
+    "BucketAllocation",
     "GENERATION_LEVELS",
+    "LinkIndex",
+    "ModuleGroup",
     "SYSTEM_PROMPTS",
+    "Selection",
+    "SelectionInputs",
+    "WikiLink",
+    "attach_wiki_links_and_backlinks",
+    "resolve_wiki_links",
+    "select_pages",
+    "summarize_selection",
     "ApiContractContext",
     "ArchitectureDiagramContext",
     "Checkpoint",
@@ -57,7 +81,6 @@ __all__ = [
     "ContextAssembler",
     "DeadCodeConfig",
     "DecisionSummary",
-    "DiffSummaryContext",
     "EditorFileData",
     "EditorFileDataFetcher",
     "FilePageContext",
@@ -82,4 +105,5 @@ __all__ = [
     "compute_page_id",
     "compute_source_hash",
     "decay_confidence",
+    "detect_code_api_contracts",
 ]

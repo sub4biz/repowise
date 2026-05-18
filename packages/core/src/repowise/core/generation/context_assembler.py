@@ -67,6 +67,11 @@ class FilePageContext:
     heritage: list[dict] = field(default_factory=list)
     community_label: str = ""
     community_cohesion: float = 0.0
+    # Architectural decisions touching this file (extracted by
+    # DecisionExtractor — inline WHY/DECISION markers, README mining,
+    # git archaeology). Kept short on purpose; the module-page renders
+    # the full list.
+    decision_records: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -100,6 +105,13 @@ class ModulePageContext:
     community_label: str = ""
     community_cohesion: float = 0.0
     key_classes: list[dict] = field(default_factory=list)
+    # Phase 2 enrichment: surfaced when available, gracefully degrades.
+    decision_records: list[dict] = field(default_factory=list)
+    dead_code_findings: list[dict] = field(default_factory=list)
+    external_systems: list[dict] = field(default_factory=list)
+    # Top files inside the module by PageRank, for the "key files" section.
+    key_files: list[dict] = field(default_factory=list)
+    top_owners: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -136,6 +148,9 @@ class RepoOverviewContext:
     # Graph intelligence enrichment
     communities: list[dict] = field(default_factory=list)
     execution_flows: list[dict] = field(default_factory=list)
+    # Phase 2: third-party dependencies + headline architectural decisions
+    external_systems: list[dict] = field(default_factory=list)
+    decision_records: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -162,32 +177,6 @@ class InfraPageContext:
     language: str
     raw_content: str
     targets: list[str]
-
-
-@dataclass
-class DiffSummaryContext:
-    from_ref: str
-    to_ref: str
-    added_files: list[str]
-    deleted_files: list[str]
-    modified_files: list[str]
-    symbol_diffs: list[Any]
-    affected_page_ids: list[str]
-    trigger_commit_sha: str | None = None
-    trigger_commit_message: str | None = None
-    trigger_commit_author: str | None = None
-    diff_text: str | None = None
-
-
-@dataclass
-class CrossPackageContext:
-    source_package: str
-    target_package: str
-    coupling_strength: int  # number of boundary files
-    used_symbols: list[str]  # public symbols from target used by source
-    boundary_files: list[str]  # files in source that import from target
-    source_pagerank_mean: float
-    target_pagerank_mean: float
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +233,7 @@ class ContextAssembler:
         git_meta: dict | None = None,
         dead_code_findings: list[dict] | None = None,
         page_summaries: dict[str, str] | None = None,
+        decision_records: list[dict] | None = None,
     ) -> FilePageContext:
         """Assemble context for the file_page template."""
         path = parsed.file_info.path
@@ -349,6 +339,7 @@ class ContextAssembler:
             heritage=heritage_entries,
             community_label=community_label,
             community_cohesion=community_cohesion,
+            decision_records=decision_records or [],
         )
 
     # ------------------------------------------------------------------
@@ -406,6 +397,12 @@ class ContextAssembler:
         file_contexts: list[FilePageContext],
         graph: Any,  # nx.DiGraph
         page_summaries: dict[str, str] | None = None,
+        git_meta_map: dict[str, dict] | None = None,
+        decision_records: list[dict] | None = None,
+        dead_code_findings: list[dict] | None = None,
+        external_systems: list[dict] | None = None,
+        community_label: str | None = None,
+        community_cohesion: float | None = None,
     ) -> ModulePageContext:
         """Assemble context for the module_page template."""
         total_symbols = sum(len(fc.symbols) for fc in file_contexts)
@@ -436,16 +433,47 @@ class ContextAssembler:
                 if fp in page_summaries:
                     file_summaries[fp] = page_summaries[fp][:200]
 
-        # Community info: pick the dominant community label across files
-        community_label = ""
-        community_cohesion = 0.0
-        labels = [fc.community_label for fc in file_contexts if fc.community_label]
-        if labels:
+        # Community info: prefer caller-supplied label (community-grouped
+        # module pages already know their label), else derive the dominant
+        # label across files.
+        if community_label is None:
+            community_label = ""
+            labels = [fc.community_label for fc in file_contexts if fc.community_label]
+            if labels:
+                from collections import Counter
+                community_label = Counter(labels).most_common(1)[0][0]
+        if community_cohesion is None:
+            community_cohesion = 0.0
+            cohesions = [fc.community_cohesion for fc in file_contexts if fc.community_cohesion > 0]
+            if cohesions:
+                community_cohesion = sum(cohesions) / len(cohesions)
+
+        # Key files inside the module by PageRank, with a short summary.
+        ranked = sorted(file_contexts, key=lambda fc: fc.pagerank_score, reverse=True)[:10]
+        key_files = [
+            {
+                "path": fc.file_path,
+                "pagerank": round(fc.pagerank_score, 4),
+                "summary": (file_summaries.get(fc.file_path) or "").strip()[:200],
+                "is_entry_point": fc.is_entry_point,
+            }
+            for fc in ranked
+        ]
+
+        # Aggregate ownership from git metadata: who maintains the most
+        # files in this module.
+        top_owners: list[dict] = []
+        if git_meta_map:
             from collections import Counter
-            community_label = Counter(labels).most_common(1)[0][0]
-        cohesions = [fc.community_cohesion for fc in file_contexts if fc.community_cohesion > 0]
-        if cohesions:
-            community_cohesion = sum(cohesions) / len(cohesions)
+            owner_counts: Counter[str] = Counter()
+            for fp in files:
+                meta = git_meta_map.get(fp)
+                if meta and meta.get("primary_owner_name"):
+                    owner_counts[meta["primary_owner_name"]] += 1
+            top_owners = [
+                {"name": name, "file_count": count}
+                for name, count in owner_counts.most_common(3)
+            ]
 
         # Key classes: collect classes with heritage info from file contexts
         key_classes: list[dict] = []
@@ -468,6 +496,11 @@ class ContextAssembler:
             community_label=community_label,
             community_cohesion=community_cohesion,
             key_classes=key_classes,
+            decision_records=decision_records or [],
+            dead_code_findings=dead_code_findings or [],
+            external_systems=external_systems or [],
+            key_files=key_files,
+            top_owners=top_owners,
         )
 
     # ------------------------------------------------------------------
@@ -518,6 +551,8 @@ class ContextAssembler:
         sccs: list[Any],  # list[frozenset[str]]
         community: dict[str, int],
         graph_builder: Any | None = None,
+        external_systems: list[dict] | None = None,
+        decision_records: list[dict] | None = None,
     ) -> RepoOverviewContext:
         """Assemble context for the repo_overview template."""
         # Top files sorted by PageRank descending
@@ -572,6 +607,8 @@ class ContextAssembler:
             circular_dependency_count=circular_count,
             communities=communities_list,
             execution_flows=execution_flows_list,
+            external_systems=external_systems or [],
+            decision_records=decision_records or [],
         )
 
     # ------------------------------------------------------------------
@@ -676,88 +713,6 @@ class ContextAssembler:
             language=parsed.file_info.language,
             raw_content=raw_content,
             targets=targets,
-        )
-
-    # ------------------------------------------------------------------
-    # Diff summary
-    # ------------------------------------------------------------------
-
-    def assemble_diff_summary(
-        self,
-        file_diffs: list[Any],  # list[FileDiff]
-        affected_pages: Any,  # AffectedPages
-        from_ref: str,
-        to_ref: str,
-    ) -> DiffSummaryContext:
-        """Assemble context for the diff_summary template."""
-        added_files = [d.path for d in file_diffs if d.status == "added"]
-        deleted_files = [d.path for d in file_diffs if d.status == "deleted"]
-        modified_files = [d.path for d in file_diffs if d.status == "modified"]
-
-        symbol_diffs = [d.symbol_diff for d in file_diffs if d.symbol_diff is not None]
-
-        affected_page_ids = list(affected_pages.regenerate) if affected_pages else []
-
-        # Extract trigger commit from first diff that has it
-        trigger_sha = None
-        trigger_msg = None
-        trigger_author = None
-        diff_text = None
-        for d in file_diffs:
-            if getattr(d, "trigger_commit_sha", None):
-                trigger_sha = d.trigger_commit_sha
-                trigger_msg = d.trigger_commit_message
-                trigger_author = d.trigger_commit_author
-                diff_text = d.diff_text
-                break
-
-        return DiffSummaryContext(
-            from_ref=from_ref,
-            to_ref=to_ref,
-            added_files=added_files,
-            deleted_files=deleted_files,
-            modified_files=modified_files,
-            symbol_diffs=symbol_diffs,
-            affected_page_ids=affected_page_ids,
-            trigger_commit_sha=trigger_sha,
-            trigger_commit_message=trigger_msg,
-            trigger_commit_author=trigger_author,
-            diff_text=diff_text,
-        )
-
-    # ------------------------------------------------------------------
-    # Cross-package context (Phase 9 C2)
-    # ------------------------------------------------------------------
-
-    def assemble_cross_package(
-        self,
-        source_pkg: str,
-        target_pkg: str,
-        source_fcs: list[FilePageContext],
-        target_fcs: list[FilePageContext],
-        graph: Any,
-    ) -> CrossPackageContext:
-        """Assemble context for cross-package dependency page."""
-        target_paths = {fc.file_path for fc in target_fcs}
-        boundary = [fc for fc in source_fcs if any(d in target_paths for d in fc.dependencies)]
-        used_syms = sorted(
-            {
-                sym["name"]
-                for fc in target_fcs
-                for sym in fc.symbols
-                if sym.get("visibility") == "public"
-            }
-        )[:20]
-        return CrossPackageContext(
-            source_package=source_pkg,
-            target_package=target_pkg,
-            coupling_strength=len(boundary),
-            used_symbols=used_syms,
-            boundary_files=[fc.file_path for fc in boundary],
-            source_pagerank_mean=sum(fc.pagerank_score for fc in source_fcs)
-            / max(len(source_fcs), 1),
-            target_pagerank_mean=sum(fc.pagerank_score for fc in target_fcs)
-            / max(len(target_fcs), 1),
         )
 
     # ------------------------------------------------------------------

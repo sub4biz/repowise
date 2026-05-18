@@ -278,7 +278,7 @@ def print_phase_header(
 
 _PROVIDER_DEFAULTS: dict[str, str] = {
     "gemini": "gemini-3.1-flash-lite-preview",
-    "openai": "gpt-4.1",
+    "openai": "gpt-5.4-nano",
     "anthropic": "claude-sonnet-4-6",
     "deepseek": "deepseek-v4-flash",
     "ollama": "llama3.2",
@@ -1160,6 +1160,7 @@ _PHASE_LABELS: dict[str, str] = {
     "dead_code": "Detecting dead code...",
     "decisions": "Extracting decisions...",
     "generation": "Generating pages...",
+    "onboarding": "Curating onboarding docs...",
 }
 
 

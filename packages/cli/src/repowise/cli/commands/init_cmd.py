@@ -257,6 +257,8 @@ def _run_workspace_generation(
     skip_infra: bool,
     test_run: bool,
     reasoning: str = "auto",
+    onboarding: bool = True,
+    coverage_pct: float | None = None,
 ) -> list[Any]:
     """Run LLM generation for a single repo in the workspace init flow.
 
@@ -317,19 +319,79 @@ def _run_workspace_generation(
     except ImportError:
         vector_store = InMemoryVectorStore(embedder_impl)
 
-    # Cost estimate
+    # Coverage chooser — interactive when TTY, falls back to the
+    # ``coverage`` flag (or the default of 20%) for non-TTY / CI runs.
+    # Computes per-option counts + costs from the live ingestion data
+    # so the table never lies about what generation will produce.
+    from repowise.cli.cost_estimator import compute_coverage_options
+    from repowise.cli.coverage_select import interactive_coverage_select
+
     gen_config = GenerationConfig(
         max_concurrency=concurrency,
         reasoning=resolve_reasoning(reasoning),
+        enable_onboarding=onboarding,
     )
-    plans = build_generation_plan(
-        result.parsed_files, result.graph_builder, gen_config, skip_tests, skip_infra
+    use_interactive_coverage = (
+        sys.stdin.isatty() and coverage_pct is None and not yes
     )
-    est = estimate_cost(plans, provider.provider_name, provider.model_name)
+    if use_interactive_coverage:
+        options = compute_coverage_options(
+            parsed_files=result.parsed_files,
+            graph_builder=result.graph_builder,
+            base_config=gen_config,
+            provider_name=provider.provider_name,
+            model_name=provider.model_name,
+            repo_path=repo_path,
+            skip_tests=skip_tests,
+            skip_infra=skip_infra,
+        )
+        chosen = interactive_coverage_select(console, options)
+        chosen_pct = chosen.pct
+        plans = chosen.plans
+        est = chosen.estimate
+    else:
+        chosen_pct = coverage_pct if coverage_pct is not None else gen_config.coverage_pct
+        from dataclasses import replace as _replace
+
+        gen_config_for_plan = _replace(
+            gen_config, coverage_pct=chosen_pct, max_pages_pct=chosen_pct
+        )
+        plans = build_generation_plan(
+            result.parsed_files,
+            result.graph_builder,
+            gen_config_for_plan,
+            skip_tests,
+            skip_infra,
+        )
+        est = estimate_cost(
+            plans,
+            provider.provider_name,
+            provider.model_name,
+            repo_path=repo_path,
+        )
+
+    # Bake the chosen coverage into the gen_config that runs generation,
+    # so the page generator's selection layer honors the user's pick.
+    from dataclasses import replace as _replace_cfg
+
+    gen_config = _replace_cfg(
+        gen_config, coverage_pct=chosen_pct, max_pages_pct=chosen_pct
+    )
+
+    if est.cost_range is not None:
+        cost_str = (
+            f"${est.cost_range.low:.2f} - ${est.cost_range.high:.2f} USD "
+            f"(median ${est.estimated_cost_usd:.2f})"
+        )
+        if est.is_calibrated:
+            cost_str += " [calibrated]"
+    else:
+        cost_str = f"${est.estimated_cost_usd:.2f} USD"
 
     console.print(
-        f"    Estimated tokens: ~{est.estimated_input_tokens + est.estimated_output_tokens:,} "
-        f"(${est.estimated_cost_usd:.2f} USD, {est.total_pages} pages)"
+        f"    Coverage: {int(chosen_pct * 100)}% / "
+        f"~{est.estimated_input_tokens + est.estimated_output_tokens:,} tokens "
+        f"({cost_str}, {est.total_pages} pages)"
     )
 
     if (
@@ -430,6 +492,8 @@ def _workspace_init(
     dry_run: bool = False,
     resume: bool = False,
     force: bool = False,
+    onboarding: bool = True,
+    coverage_pct: float | None = None,
 ) -> None:
     """Multi-repo workspace initialization.
 
@@ -539,6 +603,11 @@ def _workspace_init(
     if not index_only:
         try:
             provider = resolve_provider(provider_name, model, primary_repo.path)
+            # Re-resolve the embedder now that interactive_provider_select
+            # may have set the provider's API key in os.environ. Without
+            # this, full-mode runs would display "mock" forever because
+            # the initial resolution happened before the key was available.
+            embedder_name_resolved = _resolve_embedder(embedder_name)
             console.print(
                 f"  Provider: [cyan]{provider.provider_name}[/cyan] / "
                 f"Model: [cyan]{provider.model_name}[/cyan]"
@@ -656,6 +725,8 @@ def _workspace_init(
                         skip_infra=skip_infra,
                         test_run=test_run,
                         reasoning=resolved_reasoning,
+                        onboarding=onboarding,
+                        coverage_pct=coverage_pct,
                     )
                     result.generated_pages = generated_pages
                     total_pages += len(generated_pages)
@@ -916,6 +987,29 @@ def _workspace_init(
     default=False,
     help="In multi-repo mode, index all detected repos without prompting.",
 )
+@click.option(
+    "--onboarding/--no-onboarding",
+    "onboarding",
+    default=True,
+    help=(
+        "Generate the curated Onboarding collection (Project Overview, "
+        "Architecture Guide, Getting Started, Codebase Map, Key Concepts, "
+        "How It Works, Development Guide, Active Landscape). Default: on. "
+        "Slots with insufficient signal are skipped automatically."
+    ),
+)
+@click.option(
+    "--coverage",
+    "coverage_pct",
+    type=float,
+    default=None,
+    metavar="PCT",
+    help=(
+        "Documentation coverage as a fraction of repo files (e.g. 0.10, 0.20, "
+        "0.50). Bypasses the interactive coverage chooser. Default when "
+        "interactive: prompt; otherwise 0.20."
+    ),
+)
 def init_command(
     path: str | None,
     provider_name: str | None,
@@ -937,6 +1031,8 @@ def init_command(
     no_claude_md: bool,
     include_submodules: bool,
     init_all: bool,
+    onboarding: bool,
+    coverage_pct: float | None,
 ) -> None:
     """Generate wiki documentation for a codebase.
 
@@ -995,6 +1091,8 @@ def init_command(
             dry_run=dry_run,
             resume=resume,
             force=force,
+            onboarding=onboarding,
+            coverage_pct=coverage_pct,
         )
         return
 
@@ -1126,6 +1224,11 @@ def init_command(
             provider_name, model = _ips(console, model)
 
         provider = resolve_provider(provider_name, model, repo_path)
+        # resolve_provider / interactive_provider_select may have just set
+        # the API key in os.environ. Re-resolve the embedder so the
+        # display (and the embed path below) honors the key the user just
+        # pasted, rather than the pre-prompt "mock" fallback.
+        embedder_name_resolved = _resolve_embedder(embedder_name)
         if not is_interactive:
             console.print(f"[bold]repowise init[/bold] — {repo_path}")
         console.print(
@@ -1266,17 +1369,60 @@ def init_command(
             f"Generating wiki pages with {provider.provider_name} / {provider.model_name}",
         )
 
-        # Cost estimation
+        # Cost estimation + coverage selection. The coverage chooser
+        # is rendered interactively when stdin is a TTY and no explicit
+        # ``--coverage`` flag was passed; otherwise the configured
+        # percentage drives a single non-interactive estimate.
+        from dataclasses import replace as _replace_cfg
+        from repowise.cli.cost_estimator import compute_coverage_options
+        from repowise.cli.coverage_select import interactive_coverage_select
         from repowise.core.generation import GenerationConfig
+
         gen_config = GenerationConfig(
             max_concurrency=concurrency,
             language=language,
             reasoning=resolved_reasoning,
+            enable_onboarding=onboarding,
         )
-        plans = build_generation_plan(
-            result.parsed_files, result.graph_builder, gen_config, skip_tests, skip_infra
+        if sys.stdin.isatty() and coverage_pct is None and not yes:
+            options = compute_coverage_options(
+                parsed_files=result.parsed_files,
+                graph_builder=result.graph_builder,
+                base_config=gen_config,
+                provider_name=provider.provider_name,
+                model_name=provider.model_name,
+                repo_path=repo_path,
+                skip_tests=skip_tests,
+                skip_infra=skip_infra,
+            )
+            chosen = interactive_coverage_select(console, options)
+            chosen_pct = chosen.pct
+            plans = chosen.plans
+            est = chosen.estimate
+        else:
+            chosen_pct = (
+                coverage_pct if coverage_pct is not None else gen_config.coverage_pct
+            )
+            gen_config_for_plan = _replace_cfg(
+                gen_config, coverage_pct=chosen_pct, max_pages_pct=chosen_pct
+            )
+            plans = build_generation_plan(
+                result.parsed_files,
+                result.graph_builder,
+                gen_config_for_plan,
+                skip_tests,
+                skip_infra,
+            )
+            est = estimate_cost(
+                plans,
+                provider.provider_name,
+                provider.model_name,
+                repo_path=repo_path,
+            )
+
+        gen_config = _replace_cfg(
+            gen_config, coverage_pct=chosen_pct, max_pages_pct=chosen_pct
         )
-        est = estimate_cost(plans, provider.provider_name, provider.model_name)
 
         table = Table(title="Generation Plan", border_style=BRAND)
         table.add_column("Page Type", style="cyan")
@@ -1295,10 +1441,31 @@ def init_command(
             lang_parts = [f"{lang} {pct:.0%}" for lang, pct in lang_items]
             console.print(f"  Languages: {', '.join(lang_parts)}")
 
+        if est.cost_range is not None:
+            cost_str = (
+                f"${est.cost_range.low:.2f} - ${est.cost_range.high:.2f} USD "
+                f"(median ${est.estimated_cost_usd:.2f})"
+            )
+            if est.is_calibrated:
+                cost_str += " [calibrated]"
+        else:
+            cost_str = f"${est.estimated_cost_usd:.2f} USD"
+
         console.print(
-            f"  Estimated tokens: ~{est.estimated_input_tokens + est.estimated_output_tokens:,} "
-            f"(${est.estimated_cost_usd:.2f} USD)"
+            f"  Coverage: {int(chosen_pct * 100)}% / "
+            f"~{est.estimated_input_tokens + est.estimated_output_tokens:,} tokens "
+            f"({cost_str})"
         )
+        if onboarding:
+            console.print(
+                "  [cyan]Onboarding collection:[/cyan] "
+                "[dim]up to 8 curated pages — Project Overview, Architecture Guide, "
+                "Getting Started, Codebase Map, Key Concepts, How It Works, "
+                "Development Guide, Active Landscape "
+                "(slots without enough signal are skipped).[/dim]"
+            )
+        else:
+            console.print("  [dim]Onboarding collection: disabled (--no-onboarding).[/dim]")
         console.print()
 
         if dry_run:
@@ -1448,6 +1615,23 @@ def init_command(
     with console.status("  Persisting to database…", spinner="dots"):
         run_async(_persist_result(result, repo_path))
     console.print("  [green]✓[/green] Database updated")
+
+    # Persist the onboarding choice so subsequent `repowise update` runs
+    # honor it without re-passing the flag. Default True is omitted to keep
+    # config files tidy — only the override is recorded.
+    if not onboarding:
+        cfg = load_config(repo_path)
+        cfg["enable_onboarding"] = False
+        try:
+            import yaml  # type: ignore[import-untyped]
+
+            cfg_path = repo_path / ".repowise" / "config.yaml"
+            cfg_path.write_text(
+                yaml.dump(cfg, default_flow_style=False, sort_keys=False),
+                encoding="utf-8",
+            )
+        except ImportError:
+            pass
 
     # ---- Post-run: config, state, MCP, editor project files ----
     if commit_limit is not None:

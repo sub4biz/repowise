@@ -18,6 +18,7 @@ import hashlib
 import re
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -27,8 +28,9 @@ import structlog
 
 from repowise.core.ingestion.languages.registry import REGISTRY as _LANG_REGISTRY
 from repowise.core.ingestion.models import ParsedFile, RepoStructure
-from repowise.core.providers.llm.base import BaseProvider, GeneratedResponse
+from repowise.core.providers.llm.base import BaseProvider, CacheHint, GeneratedResponse
 
+from . import onboarding as _onboarding
 from .context_assembler import ContextAssembler, FilePageContext
 from .models import (
     GENERATION_LEVELS,
@@ -39,6 +41,23 @@ from .models import (
 )
 
 log = structlog.get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class PriorPage:
+    """Snapshot of a previously-generated page used for cross-run reuse.
+
+    Lives in :class:`PageGenerator` keyed by ``page_id``. When the freshly
+    rendered prompt produces a matching ``source_hash`` under the same
+    ``model_name``, the LLM call is skipped and ``content`` is reused.
+    """
+
+    source_hash: str
+    model_name: str
+    content: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_tokens: int = 0
 
 _LANGUAGE_NAMES = {
     "en": "English",
@@ -112,17 +131,13 @@ SYSTEM_PROMPTS: dict[str, str] = {
         "Output markdown only. "
         "Required sections: ## Purpose, ## Key Targets/Stages, ## Configuration, ## Operational Notes."
     ),
-    "diff_summary": (
-        "You are repowise, an expert technical documentation generator. "
-        "Summarise the changes between two git refs and their documentation impact. "
-        "Output markdown only. "
-        "Required sections: ## Summary, ## Changed Files, ## Symbol Changes, ## Affected Documentation."
-    ),
-    "cross_package": (
-        "You are repowise, an expert technical documentation generator. "
-        "Document the cross-package boundary and integration points. "
-        "Output markdown only. "
-        "Required sections: ## Overview, ## Package Boundaries, ## Integration Points."
+    "onboarding": (
+        "You are repowise, an expert technical documentation generator producing "
+        "a single page in a curated Onboarding collection that a new contributor "
+        "or LLM agent reads first. "
+        "Write concise, navigable prose grounded in the structured signals supplied. "
+        "Do not invent file paths, symbol names, or rationale that is not in the context. "
+        "Output markdown only — follow the exact section structure the user prompt prescribes."
     ),
 }
 
@@ -155,6 +170,7 @@ class PageGenerator:
         jinja_env: jinja2.Environment | None = None,
         vector_store: Any | None = None,
         language: str = "en",
+        prior_pages: dict[str, "PriorPage"] | None = None,
     ) -> None:
         self._provider = provider
         self._assembler = assembler
@@ -162,6 +178,13 @@ class PageGenerator:
         self._vector_store = vector_store
         self._language = language
         self._cache: dict[str, GeneratedResponse] = {}
+        # Map of page_id → PriorPage from previous generation runs. When the
+        # rendered prompt's source_hash matches the prior page's hash AND the
+        # model is the same, the LLM call is skipped and the prior content is
+        # reused. Wired by the orchestrator from the persisted wiki_pages
+        # table.
+        self._prior_pages: dict[str, PriorPage] = prior_pages or {}
+        self._reuse_count: int = 0
 
         if jinja_env is None:
             templates_dir = Path(__file__).parent / "templates"
@@ -190,7 +213,9 @@ class PageGenerator:
             parsed, graph, pagerank, betweenness, community, source_bytes
         )
         user_prompt = self._render("file_page.j2", ctx=ctx)
-        response = await self._call_provider("file_page", user_prompt, str(uuid.uuid4()))
+        response = await self._call_provider(
+            "file_page", user_prompt, str(uuid.uuid4()), target_path=parsed.file_info.path
+        )
         return self._build_generated_page(
             "file_page",
             parsed.file_info.path,
@@ -216,7 +241,10 @@ class PageGenerator:
             source_bytes=(source_map or {}).get(parsed.file_info.path, b""),
         )
         user_prompt = self._render("symbol_spotlight.j2", ctx=ctx)
-        response = await self._call_provider("symbol_spotlight", user_prompt, str(uuid.uuid4()))
+        target = f"{parsed.file_info.path}::{symbol.name}"
+        response = await self._call_provider(
+            "symbol_spotlight", user_prompt, str(uuid.uuid4()), target_path=target
+        )
         return self._build_generated_page(
             "symbol_spotlight",
             f"{parsed.file_info.path}::{symbol.name}",
@@ -234,6 +262,12 @@ class PageGenerator:
         graph: Any,
         git_meta_map: dict[str, dict] | None = None,
         page_summaries: dict[str, str] | None = None,
+        decision_records: list[dict] | None = None,
+        dead_code_findings: list[dict] | None = None,
+        external_systems: list[dict] | None = None,
+        community_label: str | None = None,
+        community_cohesion: float | None = None,
+        target_path: str | None = None,
     ) -> GeneratedPage:
         ctx = self._assembler.assemble_module_page(
             module_path,
@@ -241,6 +275,12 @@ class PageGenerator:
             file_contexts,
             graph,
             page_summaries=page_summaries,
+            git_meta_map=git_meta_map,
+            decision_records=decision_records,
+            dead_code_findings=dead_code_findings,
+            external_systems=external_systems,
+            community_label=community_label,
+            community_cohesion=community_cohesion,
         )
         module_git_summary = None
         if git_meta_map:
@@ -261,10 +301,13 @@ class PageGenerator:
                     "most_active_commits_90d": most_active.get("commit_count_90d", 0),
                 }
         user_prompt = self._render("module_page.j2", ctx=ctx, module_git_summary=module_git_summary)
-        response = await self._call_provider("module_page", user_prompt, str(uuid.uuid4()))
+        page_target = target_path or module_path
+        response = await self._call_provider(
+            "module_page", user_prompt, str(uuid.uuid4()), target_path=page_target
+        )
         return self._build_generated_page(
             "module_page",
-            module_path,
+            page_target,
             f"Module: {module_path}",
             response,
             compute_source_hash(user_prompt),
@@ -279,7 +322,9 @@ class PageGenerator:
     ) -> GeneratedPage:
         ctx = self._assembler.assemble_scc_page(scc_id, scc_files, file_contexts)
         user_prompt = self._render("scc_page.j2", ctx=ctx)
-        response = await self._call_provider("scc_page", user_prompt, str(uuid.uuid4()))
+        response = await self._call_provider(
+            "scc_page", user_prompt, str(uuid.uuid4()), target_path=scc_id
+        )
         return self._build_generated_page(
             "scc_page",
             scc_id,
@@ -298,6 +343,8 @@ class PageGenerator:
         git_meta_map: dict[str, dict] | None = None,
         graph_builder: Any | None = None,
         repo_name: str | None = None,
+        external_systems: list[dict] | None = None,
+        decision_records: list[dict] | None = None,
     ) -> GeneratedPage:
         ctx = self._assembler.assemble_repo_overview(
             repo_structure,
@@ -305,6 +352,8 @@ class PageGenerator:
             sccs,
             community,
             graph_builder=graph_builder,
+            external_systems=external_systems,
+            decision_records=decision_records,
         )
         repo_git_summary = None
         if git_meta_map:
@@ -322,10 +371,12 @@ class PageGenerator:
                 "oldest_file": oldest.get("file_path", "") if oldest else "",
                 "oldest_file_age_days": oldest.get("age_days", 0) if oldest else 0,
             }
-        user_prompt = self._render("repo_overview.j2", ctx=ctx, repo_git_summary=repo_git_summary)
-        response = await self._call_provider("repo_overview", user_prompt, str(uuid.uuid4()))
         if not repo_name:
             repo_name = getattr(repo_structure, "name", None) or "repo"
+        user_prompt = self._render("repo_overview.j2", ctx=ctx, repo_git_summary=repo_git_summary)
+        response = await self._call_provider(
+            "repo_overview", user_prompt, str(uuid.uuid4()), target_path=repo_name
+        )
         return self._build_generated_page(
             "repo_overview",
             repo_name,
@@ -347,7 +398,9 @@ class PageGenerator:
             graph, pagerank, community, sccs, repo_name
         )
         user_prompt = self._render("architecture_diagram.j2", ctx=ctx)
-        response = await self._call_provider("architecture_diagram", user_prompt, str(uuid.uuid4()))
+        response = await self._call_provider(
+            "architecture_diagram", user_prompt, str(uuid.uuid4()), target_path=repo_name
+        )
         return self._build_generated_page(
             "architecture_diagram",
             repo_name,
@@ -364,7 +417,9 @@ class PageGenerator:
     ) -> GeneratedPage:
         ctx = self._assembler.assemble_api_contract(parsed, source_bytes)
         user_prompt = self._render("api_contract.j2", ctx=ctx)
-        response = await self._call_provider("api_contract", user_prompt, str(uuid.uuid4()))
+        response = await self._call_provider(
+            "api_contract", user_prompt, str(uuid.uuid4()), target_path=parsed.file_info.path
+        )
         return self._build_generated_page(
             "api_contract",
             parsed.file_info.path,
@@ -374,6 +429,54 @@ class PageGenerator:
             GENERATION_LEVELS["api_contract"],
         )
 
+    async def generate_onboarding_page(
+        self,
+        spec: "_onboarding.SubkindSpec",
+        signals: "_onboarding.OnboardingSignals",
+    ) -> GeneratedPage | None:
+        """Generate one onboarding page from a registered subkind spec.
+
+        Returns ``None`` when the subkind's gate fails (``build_context``
+        returned ``None``) — the slot is silently skipped for this repo.
+        """
+        ctx = spec.build_context(signals)
+        if ctx is None:
+            log.debug("onboarding.gate_skipped", slot=spec.slot)
+            return None
+
+        template_name = f"onboarding/{spec.template}"
+        user_prompt = self._render(template_name, ctx=ctx, slot=spec.slot)
+        target = _onboarding.target_path(spec.slot)
+        response = await self._call_provider(
+            "onboarding", user_prompt, str(uuid.uuid4()), target_path=target
+        )
+        page = self._build_generated_page(
+            "onboarding",
+            target,
+            spec.title,
+            response,
+            compute_source_hash(user_prompt),
+            GENERATION_LEVELS["onboarding"],
+        )
+        # Subkind discriminator lives in metadata; page_type alone is shared
+        # across all six generated onboarding slots.
+        page.metadata["subkind"] = spec.slot
+        page.metadata["onboarding_slot"] = spec.slot
+        return page
+
+    @staticmethod
+    def _tag_promoted_pages(pages: list[GeneratedPage]) -> None:
+        """Tag repo_overview / architecture_diagram pages with their slot.
+
+        Mutates each matching page's ``metadata["onboarding_slot"]`` so the
+        UI groups them into the Onboarding folder without changing their
+        underlying ``page_type``. Idempotent and tolerant of missing pages.
+        """
+        for page in pages:
+            slot = _onboarding.PROMOTED_SLOTS.get(page.page_type)
+            if slot is not None:
+                page.metadata["onboarding_slot"] = slot
+
     async def generate_infra_page(
         self,
         parsed: ParsedFile,
@@ -381,7 +484,9 @@ class PageGenerator:
     ) -> GeneratedPage:
         ctx = self._assembler.assemble_infra_page(parsed, source_bytes)
         user_prompt = self._render("infra_page.j2", ctx=ctx)
-        response = await self._call_provider("infra_page", user_prompt, str(uuid.uuid4()))
+        response = await self._call_provider(
+            "infra_page", user_prompt, str(uuid.uuid4()), target_path=parsed.file_info.path
+        )
         return self._build_generated_page(
             "infra_page",
             parsed.file_info.path,
@@ -389,28 +494,6 @@ class PageGenerator:
             response,
             compute_source_hash(user_prompt),
             GENERATION_LEVELS["infra_page"],
-        )
-
-    async def generate_cross_package(
-        self,
-        source_pkg: str,
-        target_pkg: str,
-        source_fcs: list[FilePageContext],
-        target_fcs: list[FilePageContext],
-        graph: Any,
-    ) -> GeneratedPage:
-        ctx = self._assembler.assemble_cross_package(
-            source_pkg, target_pkg, source_fcs, target_fcs, graph
-        )
-        user_prompt = self._render("cross_package.j2", ctx=ctx)
-        response = await self._call_provider("cross_package", user_prompt, str(uuid.uuid4()))
-        return self._build_generated_page(
-            "cross_package",
-            f"{source_pkg}->{target_pkg}",
-            f"Cross-Package: {source_pkg} → {target_pkg}",
-            response,
-            compute_source_hash(user_prompt),
-            GENERATION_LEVELS["cross_package"],
         )
 
     # ------------------------------------------------------------------
@@ -427,9 +510,13 @@ class PageGenerator:
         job_system: Any | None = None,  # JobSystem | None
         on_page_done: Callable[[str], None] | None = None,
         on_total_known: Callable[[int], None] | None = None,
+        on_subphase: Callable[[str, int | None], None] | None = None,
         git_meta_map: dict[str, dict] | None = None,
         resume: bool = False,
         repo_path: Path | str | None = None,
+        dead_code_report: Any | None = None,
+        decision_report: Any | None = None,
+        external_systems: list[dict] | None = None,
     ) -> list[GeneratedPage]:
         """Generate all wiki pages for a repository.
 
@@ -455,6 +542,39 @@ class PageGenerator:
         betweenness = graph_builder.betweenness_centrality()
         community = graph_builder.community_detection()
         sccs = graph_builder.strongly_connected_components()
+
+        # ---- Build per-file lookup maps from phase-2 signals ----
+        dead_code_by_file: dict[str, list[dict]] = {}
+        if dead_code_report is not None and getattr(dead_code_report, "findings", None):
+            for f in dead_code_report.findings:
+                dead_code_by_file.setdefault(f.file_path, []).append(
+                    {
+                        "symbol_name": f.symbol_name,
+                        "symbol_kind": f.symbol_kind,
+                        "kind": str(f.kind),
+                        "reason": f.reason,
+                        "confidence": f.confidence,
+                        "safe_to_delete": f.safe_to_delete,
+                    }
+                )
+
+        decisions_by_file: dict[str, list[dict]] = {}
+        decisions_all: list[dict] = []
+        if decision_report is not None and getattr(decision_report, "decisions", None):
+            for d in decision_report.decisions:
+                payload = {
+                    "title": d.title,
+                    "decision": d.decision,
+                    "rationale": d.rationale,
+                    "source": d.source,
+                    "confidence": d.confidence,
+                    "evidence_file": d.evidence_file,
+                }
+                decisions_all.append(payload)
+                for fp in d.affected_files or []:
+                    decisions_by_file.setdefault(fp, []).append(payload)
+
+        external_systems = external_systems or []
 
         all_pages: list[GeneratedPage] = []
         semaphore = asyncio.Semaphore(self._config.max_concurrency)
@@ -493,40 +613,61 @@ class PageGenerator:
                 self._provider.model_name,
             )
 
+        async def _embed_async(page: GeneratedPage) -> None:
+            """Embed a finished page into the vector store. Safe to fire-and-forget.
+
+            Errors are swallowed at debug level — embedding is a RAG
+            enhancement, not load-bearing for the page itself.
+            """
+            try:
+                summary = _extract_summary(page.content)
+                async with embed_semaphore:
+                    await self._vector_store.embed_and_upsert(
+                        page.page_id,
+                        page.content,
+                        {
+                            "page_type": page.page_type,
+                            "target_path": page.target_path,
+                            "content": page.content[:600],
+                            "summary": summary,
+                        },
+                    )
+            except Exception as e:
+                log.debug("rag.embed_failed", page_id=page.page_id, error=str(e))
+
         async def run_level(named_coros: list[tuple[str, Any]], level: int) -> list[GeneratedPage]:
             if job_system is not None and job_id is not None:
                 job_system.update_level(job_id, level)
+
+            # Embed tasks spawned during this level. Drained after the
+            # gather() so the next level's RAG search sees a fully-indexed
+            # store, but never blocks the per-page wave.
+            pending_embeds: list[asyncio.Task[None]] = []
 
             async def guarded_named(page_id: str, coro: Any) -> Any:
                 try:
                     async with semaphore:
                         result = await coro
 
-                    # Embed page for RAG (B1)
-                    if self._vector_store is not None and isinstance(result, GeneratedPage):
-                        try:
-                            page_summary = _extract_summary(result.content)
-                            async with embed_semaphore:
-                                await self._vector_store.embed_and_upsert(
-                                    result.page_id,
-                                    result.content,
-                                    {
-                                        "page_type": result.page_type,
-                                        "target_path": result.target_path,
-                                        "content": result.content[:600],
-                                        "summary": page_summary,
-                                    },
-                                )
-                        except Exception as e:
-                            log.debug("rag.embed_failed", page_id=result.page_id, error=str(e))
-                    # Store summary for dependency context (B2)
                     if isinstance(result, GeneratedPage):
+                        # Summary capture is cheap (string ops) — keep
+                        # inline so the next page's context assembly sees
+                        # it immediately.
                         completed_page_summaries[result.target_path] = _extract_summary(
                             result.content
                         )
-                        # Report progress immediately (not batched after gather)
+                        # Progress tick fires the moment the LLM call
+                        # returns — the user sees the page as done before
+                        # the embed completes.
                         if on_page_done is not None:
                             on_page_done(result.page_type)
+                        # Fire-and-forget the embed/upsert. Removes ~1
+                        # embedder round-trip from this task's critical
+                        # path so the LLM slot frees up immediately.
+                        if self._vector_store is not None:
+                            pending_embeds.append(
+                                asyncio.create_task(_embed_async(result))
+                            )
                     return result
                 except Exception as exc:
                     if job_system is not None and job_id is not None:
@@ -541,13 +682,23 @@ class PageGenerator:
 
             tasks = [guarded_named(pid, c) for pid, c in named_coros]
             results = await asyncio.gather(*tasks)
+            # Drain pending embeds before declaring the level done — the
+            # next level's RAG search depends on these landing in the store.
+            if pending_embeds:
+                await asyncio.gather(*pending_embeds, return_exceptions=True)
             pages = [r for r in results if isinstance(r, GeneratedPage)]
             if job_system is not None and job_id is not None:
                 for r in pages:
                     job_system.complete_page(job_id, r.page_id)
             return pages
 
-        # ---- Budget pre-computation ----
+        # ---- Page selection (single source of truth) ----
+        # The selection subsystem scores every candidate, allocates the
+        # global budget across page-type buckets, and returns an
+        # allow-set. Each level's emit loop iterates only over members
+        # of that allow-set — there are no bypass paths. The same
+        # function is called by the cost estimator so the pre-run
+        # estimate cannot drift from the actual run.
         code_files = [
             p
             for p in parsed_files
@@ -556,97 +707,70 @@ class PageGenerator:
             and p.file_info.language in _CODE_LANGUAGES
         ]
 
-        # Sort: entry points first, then hotspots, then high PageRank (A1)
-        if git_meta_map:
-            code_files = sorted(
-                code_files,
-                key=lambda p: (
-                    not p.file_info.is_entry_point,
-                    not git_meta_map.get(p.file_info.path, {}).get("is_hotspot", False),
-                    -pagerank.get(p.file_info.path, 0.0),
-                ),
-            )
+        # Near-clone dedupe runs before scoring so clone losers never
+        # consume scoring budget. Entry points are never dropped.
+        if getattr(self._config, "dedupe_near_clones", True):
+            drop_paths = _select_clone_representatives(code_files, pagerank)
+            if drop_paths:
+                log.info("page_selection.clone_dedupe", dropped=len(drop_paths))
+                code_files = [p for p in code_files if p.file_info.path not in drop_paths]
+                parsed_files_for_selection = [
+                    p for p in parsed_files if p.file_info.path not in drop_paths
+                ]
+            else:
+                parsed_files_for_selection = parsed_files
         else:
-            code_files = sorted(
-                code_files,
-                key=lambda p: (
-                    not p.file_info.is_entry_point,
-                    -pagerank.get(p.file_info.path, 0.0),
-                ),
+            parsed_files_for_selection = parsed_files
+
+        try:
+            community_info_map = graph_builder.community_info() or {}
+        except Exception:
+            community_info_map = {}
+
+        from .selection import SelectionInputs, select_pages
+
+        selection = select_pages(
+            SelectionInputs(
+                parsed_files=parsed_files_for_selection,
+                pagerank=pagerank,
+                betweenness=betweenness,
+                community=community,
+                community_info=community_info_map,
+                sccs=list(sccs),
+                git_meta_map=git_meta_map,
+                config=self._config,
             )
-
-        code_pr_scores = sorted(
-            [pagerank.get(p.file_info.path, 0.0) for p in code_files],
-            reverse=True,
-        )
-        _all_public_symbols: list[tuple[Any, Any]] = [
-            (sym, p) for p in parsed_files for sym in p.symbols if sym.visibility == "public"
-        ]
-
-        budget = max(50, int(len(parsed_files) * self._config.max_pages_pct))
-        # Estimate fixed overhead (api, scc, module, repo_overview, arch_diagram)
-        _fixed_overhead = (
-            sum(1 for p in parsed_files if p.file_info.is_api_contract)
-            + sum(1 for scc in sccs if len(scc) > 1)
-            + len(
-                {
-                    (
-                        Path(p.file_info.path).parts[0]
-                        if len(Path(p.file_info.path).parts) > 1
-                        else "root"
-                    )
-                    for p in code_files
-                }
-            )
-            + 2  # repo_overview + architecture_diagram
-        )
-        _remaining = max(0, budget - _fixed_overhead)
-
-        # File page gets priority over symbol_spotlight
-        _n_file_uncapped = (
-            max(1, int(len(code_pr_scores) * self._config.file_page_top_percentile))
-            if code_pr_scores
-            else 0
-        )
-        _n_file_cap = min(_n_file_uncapped, _remaining)
-        pr_threshold = (
-            code_pr_scores[_n_file_cap - 1] if code_pr_scores and _n_file_cap > 0 else 0.0
         )
 
-        _sym_budget = max(0, _remaining - _n_file_cap)
-        _n_sym_uncapped = (
-            max(1, int(len(_all_public_symbols) * self._config.top_symbol_percentile))
-            if _all_public_symbols
-            else 0
-        )
-        _n_sym_cap = min(_n_sym_uncapped, _sym_budget)
+        # Bucket allow-sets — O(1) membership checks in the level loops.
+        sel_file_paths: set[str] = set(selection.file_page_paths)
+        sel_symbol_keys: set[tuple[str, str]] = set(selection.symbol_spotlights)
+        sel_api_paths: set[str] = set(selection.api_contract_paths)
+        sel_infra_paths: set[str] = set(selection.infra_paths)
+        sel_module_groups = list(selection.module_groups)
+        sel_scc_groups = list(selection.scc_groups)
 
-        # Compute estimated total and notify progress (A7)
-        # Use the actual file_page count (files passing _is_significant_file), not
-        # _n_file_cap. The cap sets pr_threshold, but files with high betweenness or
-        # entry_point status bypass that threshold, so actual count > _n_file_cap.
-        _actual_file_page_count = sum(
-            1
-            for p in code_files
-            if _is_significant_file(p, pagerank, betweenness, self._config, pr_threshold)
+        # Sort code_files for stable level-2 ordering: selected files
+        # first (so dep summaries land in the store earliest), then by
+        # PageRank desc. The topo-sort below further refines this.
+        code_files = sorted(
+            code_files,
+            key=lambda p: (
+                p.file_info.path not in sel_file_paths,
+                not p.file_info.is_entry_point,
+                -pagerank.get(p.file_info.path, 0.0),
+            ),
         )
+
         estimated_total = (
-            sum(1 for p in parsed_files if p.file_info.is_api_contract)
-            + _n_sym_cap
-            + _actual_file_page_count
-            + sum(1 for scc in sccs if len(scc) > 1)
-            + len(
-                {
-                    (
-                        Path(p.file_info.path).parts[0]
-                        if len(Path(p.file_info.path).parts) > 1
-                        else "root"
-                    )
-                    for p in code_files
-                }
-            )
-            + 2  # repo_overview + arch_diagram
-            + sum(1 for p in parsed_files if _is_infra_file(p))
+            selection.counts()["api_contract"]
+            + selection.counts()["symbol_spotlight"]
+            + selection.counts()["file_page"]
+            + selection.counts()["scc_page"]
+            + selection.counts()["module_page"]
+            + int(selection.emit_repo_overview)
+            + int(selection.emit_arch_diagram)
+            + selection.counts()["infra_page"]
         )
         remaining_total = max(0, estimated_total - len(completed_ids))
         if on_total_known is not None:
@@ -654,8 +778,12 @@ class PageGenerator:
         if job_system is not None and job_id is not None:
             job_system.start_job(job_id, estimated_total)
 
-        # ---- Level 0: api_contract ----
-        api_files = [p for p in parsed_files if p.file_info.is_api_contract]
+        # ---- Level 0: api_contract (allow-set filtered) ----
+        api_files = [
+            p
+            for p in parsed_files
+            if p.file_info.is_api_contract and p.file_info.path in sel_api_paths
+        ]
         level0_coros = [
             (
                 compute_page_id("api_contract", p.file_info.path),
@@ -664,19 +792,20 @@ class PageGenerator:
             for p in api_files
             if compute_page_id("api_contract", p.file_info.path) not in completed_ids
         ]
-        level0_pages = await run_level(level0_coros, 0)
-        all_pages.extend(level0_pages)
-
-        # ---- Level 1: symbol_spotlight (top percentile by PageRank) ----
-        all_symbols_with_file: list[tuple[Any, ParsedFile]] = _all_public_symbols
-
-        if all_symbols_with_file and _n_sym_cap > 0:
-            all_symbols_with_file.sort(
-                key=lambda x: pagerank.get(x[1].file_info.path, 0.0), reverse=True
-            )
-            top_symbols = all_symbols_with_file[:_n_sym_cap]
-        else:
-            top_symbols = []
+        # ---- Level 1: symbol_spotlight (allow-set filtered) ----
+        # The selection layer already picked the top symbols by score;
+        # here we just resolve them back to (Symbol, ParsedFile) pairs.
+        parsed_by_path: dict[str, ParsedFile] = {
+            p.file_info.path: p for p in parsed_files
+        }
+        top_symbols: list[tuple[Any, ParsedFile]] = []
+        for file_path, sym_name in selection.symbol_spotlights:
+            pf = parsed_by_path.get(file_path)
+            if pf is None:
+                continue
+            sym = next((s for s in pf.symbols if s.name == sym_name), None)
+            if sym is not None:
+                top_symbols.append((sym, pf))
 
         level1_coros = [
             (
@@ -687,8 +816,15 @@ class PageGenerator:
             if compute_page_id("symbol_spotlight", f"{pf.file_info.path}::{sym.name}")
             not in completed_ids
         ]
-        level1_pages = await run_level(level1_coros, 1)
-        all_pages.extend(level1_pages)
+
+        # Levels 0 (api_contract) and 1 (symbol_spotlight) share no
+        # data dependencies — both feed into nothing else upstream of
+        # Level 2 — so they run in one merged batch instead of two
+        # sequential barriers. ``run_level`` already bounds total
+        # concurrency via ``self._config.max_concurrency`` so the merge
+        # only removes idle slots, never over-saturates the provider.
+        level01_pages = await run_level(level0_coros + level1_coros, 1)
+        all_pages.extend(level01_pages)
 
         # ---- Level 2: file_page (significant code files only) ----
         # Context is assembled for ALL code files (module pages need it).
@@ -739,23 +875,36 @@ class PageGenerator:
 
         file_page_contexts: dict[str, FilePageContext] = {}
 
+        # Batch-prefetch dependency summaries from the vector store in a
+        # SINGLE call covering every code file's dependencies — replaces
+        # the prior per-file serial loop that turned N×M awaits into a
+        # measurable bottleneck on the level-2 critical path.
+        if self._vector_store is not None:
+            needed_deps: set[str] = set()
+            for p in code_files:
+                path_ = p.file_info.path
+                if path_ not in graph:
+                    continue
+                for dep in graph.successors(path_):
+                    if dep.startswith("external:"):
+                        continue
+                    if dep in completed_page_summaries:
+                        continue
+                    needed_deps.add(dep)
+            if needed_deps:
+                try:
+                    batch = await self._vector_store.get_page_summaries_by_paths(
+                        list(needed_deps)
+                    )
+                    for dep_path, payload in batch.items():
+                        summary = payload.get("summary") if payload else None
+                        if summary:
+                            completed_page_summaries[dep_path] = summary
+                except Exception as exc:
+                    log.debug("rag.batch_dep_prefetch_failed", error=str(exc))
+
         level2_coros: list[tuple[str, Any]] = []
         for p in code_files:
-            # Pre-fetch dependency summaries from vector store for deps not yet
-            # in the completed_page_summaries accumulator (e.g. from prior runs).
-            if self._vector_store is not None:
-                path_ = p.file_info.path
-                out_edges = list(graph.successors(path_)) if path_ in graph else []
-                internal_deps = [e for e in out_edges if not e.startswith("external:")]
-                for dep in internal_deps:
-                    if dep not in completed_page_summaries:
-                        try:
-                            result = await self._vector_store.get_page_summary_by_path(dep)
-                            if result and result.get("summary"):
-                                completed_page_summaries[dep] = result["summary"]
-                        except Exception:
-                            pass  # Non-fatal — dep context is optional
-
             ctx = self._assembler.assemble_file_page(
                 p,
                 graph,
@@ -765,25 +914,20 @@ class PageGenerator:
                 source_map.get(p.file_info.path, b""),
                 git_meta=git_meta_map.get(p.file_info.path) if git_meta_map else None,
                 page_summaries=completed_page_summaries,
+                dead_code_findings=dead_code_by_file.get(p.file_info.path),
+                decision_records=decisions_by_file.get(p.file_info.path),
             )
             file_page_contexts[p.file_info.path] = ctx
             pid = compute_page_id("file_page", p.file_info.path)
-            if (
-                _is_significant_file(p, pagerank, betweenness, self._config, pr_threshold)
-                and pid not in completed_ids
-            ):
+            if p.file_info.path in sel_file_paths and pid not in completed_ids:
                 level2_coros.append((pid, self._generate_file_page_from_ctx(p, ctx)))
 
         level2_pages = await run_level(level2_coros, 2)
         all_pages.extend(level2_pages)
 
-        # ---- Level 3: scc_page (only true cycles: len > 1) ----
+        # ---- Level 3: scc_page (allow-set filtered) ----
         scc_coros: list[tuple[str, Any]] = []
-        for i, scc in enumerate(sccs):
-            if len(scc) <= 1:
-                continue
-            scc_id = f"scc-{i}"
-            scc_files = sorted(scc)
+        for scc_id, scc_files in sel_scc_groups:
             fc_list = [file_page_contexts[f] for f in scc_files if f in file_page_contexts]
             pid = compute_page_id("scc_page", scc_id)
             if pid not in completed_ids:
@@ -791,64 +935,45 @@ class PageGenerator:
         level3_pages = await run_level(scc_coros, 3)
         all_pages.extend(level3_pages)
 
-        # ---- Level 4: module_page (grouped by top-level directory) ----
-        module_groups: dict[str, list[FilePageContext]] = {}
-        module_languages: dict[str, str] = {}
-        for p in code_files:
-            parts = Path(p.file_info.path).parts
-            module = parts[0] if len(parts) > 1 else "root"
-            fc = file_page_contexts.get(p.file_info.path)
-            if fc is not None:
-                module_groups.setdefault(module, []).append(fc)
-                module_languages[module] = p.file_info.language
-
-        level4_coros: list[tuple[str, Any]] = [
-            (
-                compute_page_id("module_page", module),
-                self.generate_module_page(
-                    module,
-                    module_languages.get(module, "unknown"),
-                    fcs,
-                    graph,
-                    git_meta_map=git_meta_map,
-                    page_summaries=completed_page_summaries,
-                ),
+        # ---- Level 4: module_page (allow-set filtered) ----
+        # Module groups come from the selection layer; we only need to
+        # resolve FilePageContext objects for the files we already
+        # built contexts for in Level 2.
+        level4_coros: list[tuple[str, Any]] = []
+        for mg in sel_module_groups:
+            fcs = [
+                file_page_contexts[fp]
+                for fp in mg.file_paths
+                if fp in file_page_contexts
+            ]
+            if not fcs:
+                continue
+            page_id = compute_page_id("module_page", mg.key)
+            if page_id in completed_ids:
+                continue
+            level4_coros.append(
+                (
+                    page_id,
+                    self.generate_module_page(
+                        mg.display,
+                        mg.language,
+                        fcs,
+                        graph,
+                        git_meta_map=git_meta_map,
+                        page_summaries=completed_page_summaries,
+                        decision_records=decisions_all,
+                        dead_code_findings=[
+                            d for fc in fcs for d in dead_code_by_file.get(fc.file_path, [])
+                        ],
+                        external_systems=external_systems,
+                        community_label=mg.label,
+                        community_cohesion=mg.cohesion,
+                        target_path=mg.key,
+                    ),
+                )
             )
-            for module, fcs in module_groups.items()
-            if compute_page_id("module_page", module) not in completed_ids
-        ]
         level4_pages = await run_level(level4_coros, 4)
         all_pages.extend(level4_pages)
-
-        # ---- Level 5: cross_package (only if monorepo) ----
-        if repo_structure.is_monorepo:
-            seen_pairs: set[tuple[str, str]] = set()
-            cross_coros: list[tuple[str, Any]] = []
-            for src_pkg, src_fcs in module_groups.items():
-                for fc in src_fcs:
-                    for dep in fc.dependencies:
-                        dep_parts = Path(dep).parts
-                        dep_pkg = dep_parts[0] if len(dep_parts) > 1 else "root"
-                        pair = (src_pkg, dep_pkg)
-                        if dep_pkg != src_pkg and pair not in seen_pairs:
-                            seen_pairs.add(pair)
-                            dep_fcs = module_groups.get(dep_pkg, [])
-                            ctx_xpkg = self._assembler.assemble_cross_package(
-                                src_pkg, dep_pkg, src_fcs, dep_fcs, graph
-                            )
-                            if ctx_xpkg.coupling_strength >= 2:
-                                pid = compute_page_id("cross_package", f"{src_pkg}->{dep_pkg}")
-                                if pid not in completed_ids:
-                                    cross_coros.append(
-                                        (
-                                            pid,
-                                            self.generate_cross_package(
-                                                src_pkg, dep_pkg, src_fcs, dep_fcs, graph
-                                            ),
-                                        )
-                                    )
-            level5_pages = await run_level(cross_coros, 5)
-            all_pages.extend(level5_pages)
 
         # ---- Level 6: repo_overview + architecture_diagram ----
         level6_coros: list[tuple[str, Any]] = []
@@ -864,6 +989,8 @@ class PageGenerator:
                         git_meta_map=git_meta_map,
                         graph_builder=graph_builder,
                         repo_name=repo_name,
+                        external_systems=external_systems,
+                        decision_records=decisions_all[:10],
                     ),
                 )
             )
@@ -874,11 +1001,12 @@ class PageGenerator:
                     self.generate_architecture_diagram(graph, pagerank, community, sccs, repo_name),
                 )
             )
-        level6_pages = await run_level(level6_coros, 6)
-        all_pages.extend(level6_pages)
-
-        # ---- Level 7: infra_page ----
-        infra_files = [p for p in parsed_files if _is_infra_file(p)]
+        # ---- Level 7: infra_page (allow-set filtered) ----
+        infra_files = [
+            p
+            for p in parsed_files
+            if _is_infra_file(p) and p.file_info.path in sel_infra_paths
+        ]
         level7_coros: list[tuple[str, Any]] = [
             (
                 compute_page_id("infra_page", p.file_info.path),
@@ -887,8 +1015,69 @@ class PageGenerator:
             for p in infra_files
             if compute_page_id("infra_page", p.file_info.path) not in completed_ids
         ]
-        level7_pages = await run_level(level7_coros, 7)
-        all_pages.extend(level7_pages)
+
+        # ---- Level 8: onboarding (curated collection) ----
+        # Each subkind defines its own gate inside build_context — slots
+        # whose gates fail return None and are skipped entirely. Promoted
+        # slots (project_overview / architecture_guide) are tagged onto the
+        # level-6 pages and don't appear here.
+        level8_coros: list[tuple[str, Any]] = []
+        if getattr(self._config, "enable_onboarding", True):
+            specs = _onboarding.iter_specs()
+            if specs:
+                if on_subphase is not None:
+                    try:
+                        on_subphase("onboarding", len(specs))
+                    except Exception:
+                        pass
+                signals = _onboarding.OnboardingSignals(
+                    repo_name=repo_name,
+                    repo_structure=repo_structure,
+                    parsed_files=tuple(parsed_files),
+                    source_map=source_map,
+                    graph_builder=graph_builder,
+                    pagerank=pagerank,
+                    betweenness=betweenness,
+                    community=community,
+                    sccs=tuple(sccs),
+                    git_meta_map=git_meta_map,
+                    dead_code_by_file=dead_code_by_file,
+                    decisions_all=tuple(decisions_all),
+                    external_systems=tuple(external_systems),
+                    completed_page_summaries=dict(completed_page_summaries),
+                )
+                for spec in specs:
+                    page_id = compute_page_id(
+                        "onboarding", _onboarding.target_path(spec.slot)
+                    )
+                    if page_id in completed_ids:
+                        continue
+                    level8_coros.append(
+                        (page_id, self.generate_onboarding_page(spec, signals))
+                    )
+
+        # Levels 6, 7, and 8 share no data dependencies with each other
+        # — Level 6 needs only the graph + repo metadata; Level 7
+        # documents standalone infra files; Level 8 consumes a frozen
+        # ``OnboardingSignals`` snapshot. Run them in a single merged
+        # batch instead of three sequential barriers.
+        final_pages = await run_level(level6_coros + level7_coros + level8_coros, 8)
+        # Tag promoted onboarding slots (repo_overview / architecture_diagram)
+        # so the UI groups them into the Onboarding folder. No content change.
+        self._tag_promoted_pages(final_pages)
+        all_pages.extend(final_pages)
+
+        # Post-generation: resolve backtick-quoted refs in every page's
+        # markdown to other pages' ``page_id``s and stash the result in
+        # ``metadata["wiki_links"]``. The reverse index lands in
+        # ``metadata["backlinks"]``. Pure regex + dict lookup — no LLM
+        # call, safe to run on every generation.
+        try:
+            from .interlinking import attach_wiki_links_and_backlinks
+
+            attach_wiki_links_and_backlinks(all_pages, parsed_files)
+        except Exception as exc:
+            log.debug("interlinking.failed", error=str(exc))
 
         # Finalize job
         if job_system is not None and job_id is not None:
@@ -912,22 +1101,49 @@ class PageGenerator:
         ctx: FilePageContext,
     ) -> GeneratedPage:
         """Generate a file_page from a pre-assembled context (avoids double-assembly)."""
-        # RAG context: query vector store for related pages (B1)
-        if self._vector_store is not None:
-            query_terms = parsed.exports or [
-                s["name"] for s in ctx.symbols[:3] if s.get("visibility") == "public"
-            ]
-            if query_terms:
+        # RAG context: query vector store for related pages (B1).
+        # Gated by two short-circuits so we don't burn an embedder
+        # round-trip on every page when the result wouldn't help:
+        #   1. ``enable_rag_context`` config flag (off → fully skip).
+        #   2. ``rag_min_store_size`` — early pages run against an empty
+        #      or near-empty store and the search returns nothing useful.
+        if self._vector_store is not None and getattr(
+            self._config, "enable_rag_context", True
+        ):
+            min_store_size = max(0, int(getattr(self._config, "rag_min_store_size", 10) or 0))
+            store_ok = True
+            if min_store_size > 0:
                 try:
-                    results = await self._vector_store.search(", ".join(query_terms[:5]), limit=3)
-                    self_id = f"file_page:{parsed.file_info.path}"
-                    ctx.rag_context = [
-                        f"[{r.page_id}]\n{r.snippet}" for r in results if r.page_id != self_id
-                    ]
-                except Exception as e:
-                    log.debug("rag.search_failed", path=parsed.file_info.path, error=str(e))
+                    current_ids = await self._vector_store.list_page_ids()
+                    store_ok = len(current_ids) >= min_store_size
+                except Exception:
+                    # If the store can't be sized cheaply, fall through to
+                    # the search — it'll either succeed or hit the
+                    # existing exception path.
+                    store_ok = True
+            if store_ok:
+                query_terms = parsed.exports or [
+                    s["name"] for s in ctx.symbols[:3] if s.get("visibility") == "public"
+                ]
+                if query_terms:
+                    try:
+                        results = await self._vector_store.search(
+                            ", ".join(query_terms[:5]), limit=3
+                        )
+                        self_id = f"file_page:{parsed.file_info.path}"
+                        ctx.rag_context = [
+                            f"[{r.page_id}]\n{r.snippet}"
+                            for r in results
+                            if r.page_id != self_id
+                        ]
+                    except Exception as e:
+                        log.debug(
+                            "rag.search_failed", path=parsed.file_info.path, error=str(e)
+                        )
         user_prompt = self._render("file_page.j2", ctx=ctx)
-        response = await self._call_provider("file_page", user_prompt, str(uuid.uuid4()))
+        response = await self._call_provider(
+            "file_page", user_prompt, str(uuid.uuid4()), target_path=parsed.file_info.path
+        )
         page = self._build_generated_page(
             "file_page",
             parsed.file_info.path,
@@ -953,14 +1169,45 @@ class PageGenerator:
         page_type: str,
         user_prompt: str,
         request_id: str,
+        target_path: str | None = None,
     ) -> GeneratedResponse:
         """Call the provider with caching, optionally prefixing a language instruction."""
+        # Persistent cross-run cache: if the page exists from a prior run, was
+        # produced by the same model, and the prompt's source_hash matches,
+        # reuse the stored content without an LLM call.
+        if self._config.cache_enabled and target_path is not None:
+            page_id = compute_page_id(page_type, target_path)
+            prior = self._prior_pages.get(page_id)
+            if prior is not None and prior.model_name == self._provider.model_name:
+                current_hash = compute_source_hash(user_prompt)
+                if prior.source_hash == current_hash:
+                    self._reuse_count += 1
+                    log.debug(
+                        "page_cache.persistent_hit",
+                        page_type=page_type,
+                        target_path=target_path,
+                    )
+                    return GeneratedResponse(
+                        content=prior.content,
+                        input_tokens=0,
+                        output_tokens=0,
+                        cached_tokens=0,
+                        usage={"reused_from_prior_run": True},
+                    )
+
         key = self._compute_cache_key(page_type, user_prompt)
         if self._config.cache_enabled and key in self._cache:
             log.debug("Cache hit", page_type=page_type, key=key[:8])
             return self._cache[key]
 
         system_prompt = self._build_system_prompt(page_type)
+
+        # The same system prompt is reused for every page of a given type, so
+        # mark it as cacheable. Providers without server-side prompt caching
+        # ignore the hint safely.
+        cache_hints: tuple[CacheHint, ...] = (
+            (CacheHint(segment="system"),) if self._config.cache_enabled else ()
+        )
 
         response = await self._provider.generate(
             system_prompt,
@@ -969,6 +1216,7 @@ class PageGenerator:
             temperature=self._config.temperature,
             request_id=request_id,
             reasoning=self._config.reasoning,
+            cache_hints=cache_hints,
         )
 
         if self._config.cache_enabled:
@@ -1126,6 +1374,18 @@ def _is_significant_file(
     if not (is_entry or pr >= pr_threshold or bet > 0.0):
         return False
 
+    # Trivial-file gate: small files with almost no symbols (data classes,
+    # marker classes, single-message wrappers like Messages/*.cs) produce
+    # low-value pages. Entry points and graph hubs (high PageRank) bypass.
+    if (
+        getattr(config, "skip_trivial_files", True)
+        and not is_entry
+        and pr < pr_threshold * 2
+        and len(parsed.symbols) <= 2
+        and parsed.file_info.size_bytes < 1500
+    ):
+        return False
+
     # Waive the symbol-count requirement for graph-connected files that have
     # no original definitions of their own (e.g. state/config modules that
     # are imported by many files but mostly re-export or assemble values).
@@ -1133,6 +1393,42 @@ def _is_significant_file(
         return is_entry or pr >= pr_threshold
 
     return True
+
+
+def _select_clone_representatives(
+    code_files: list[ParsedFile],
+    pagerank: dict[str, float],
+    *,
+    min_cluster_size: int = 3,
+) -> set[str]:
+    """Return paths of files to *drop* because they are near-clones.
+
+    Groups files by (parent_directory, signature shape), where the shape is the
+    sorted tuple of ``(symbol_kind, symbol_name)`` pairs from the parser. When
+    a cluster has at least ``min_cluster_size`` members, the highest-PageRank
+    member is kept and the rest are dropped. Entry points are never dropped.
+
+    Language-agnostic: works for any language whose symbols carry a kind+name,
+    which the parser guarantees.
+    """
+    from collections import defaultdict
+
+    clusters: dict[tuple[str, tuple[tuple[str, str], ...]], list[ParsedFile]] = defaultdict(list)
+    for p in code_files:
+        if p.file_info.is_entry_point or not p.symbols:
+            continue
+        parent = str(Path(p.file_info.path).parent.as_posix())
+        shape = tuple(sorted((str(s.kind), s.name) for s in p.symbols))
+        clusters[(parent, shape)].append(p)
+
+    drop: set[str] = set()
+    for members in clusters.values():
+        if len(members) < min_cluster_size:
+            continue
+        members.sort(key=lambda p: pagerank.get(p.file_info.path, 0.0), reverse=True)
+        for loser in members[1:]:
+            drop.add(loser.file_info.path)
+    return drop
 
 
 # ---------------------------------------------------------------------------
