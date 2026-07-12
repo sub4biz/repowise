@@ -70,6 +70,7 @@ import {
   mergeCommunitySlice,
 } from "./sigma/constellation-adapter";
 import { computeRadialLayout } from "./sigma/radial-layout";
+import { ELK_MAX_NODES, elkSkipReason } from "./sigma/use-elk-sigma-layout";
 import type { SigmaNodeAttributes, SigmaEdgeAttributes } from "./sigma/types";
 import type GraphologyGraph from "graphology";
 import { useEgoFilter } from "./sigma/use-ego-filter";
@@ -842,6 +843,15 @@ export function GraphFlow(props: GraphFlowProps) {
     }
   }, [viewMode, onViewModeChange]);
 
+  // Flow index whose trace head has already been focused, so the deferred
+  // re-focus below fires at most once per selection and never re-steers the
+  // camera on later graph changes while the same flow stays active.
+  const flowFocusedRef = useRef<number | null>(null);
+  // Live graph handle for the focus timer (the effect below deliberately
+  // keeps sigmaGraph out of its deps).
+  const sigmaGraphRef = useRef(sigmaGraph);
+  sigmaGraphRef.current = sigmaGraph;
+
   // Execution flow highlighting
   useEffect(() => {
     if (activeFlowIdx === null || !executionFlows) {
@@ -860,12 +870,36 @@ export function GraphFlow(props: GraphFlowProps) {
 
     clearTimeout(focusTimerRef.current);
     focusTimerRef.current = setTimeout(() => {
+      focusTimerRef.current = undefined;
       const firstNode = flow.trace[0];
-      if (firstNode) sigmaRef.current?.focusNode(firstNode);
+      if (!firstNode) return;
+      if (sigmaGraphRef.current?.hasNode(firstNode)) {
+        flowFocusedRef.current = activeFlowIdx;
+        sigmaRef.current?.focusNode(firstNode);
+      }
+      // Node not loaded yet (module → full jump still fetching): the
+      // deferred-focus effect below picks it up once the graph gains it.
     }, 800);
     return () => clearTimeout(focusTimerRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeFlowIdx, executionFlows]);
+
+  // Deferred flow focus: selecting a flow from the module overview kicks off
+  // the full-graph fetch, which can land after the 800ms timer above already
+  // fired against a graph without the trace head. Focus once when the graph
+  // gains the node; while the timer is still pending it stays the fast path.
+  useEffect(() => {
+    if (activeFlowIdx === null) {
+      flowFocusedRef.current = null;
+      return;
+    }
+    if (flowFocusedRef.current === activeFlowIdx) return;
+    if (focusTimerRef.current !== undefined) return;
+    const firstNode = executionFlows?.flows[activeFlowIdx]?.trace[0];
+    if (!firstNode || !sigmaGraph?.hasNode(firstNode)) return;
+    flowFocusedRef.current = activeFlowIdx;
+    sigmaRef.current?.focusNode(firstNode);
+  }, [activeFlowIdx, executionFlows, sigmaGraph]);
 
   // Context value (hover fields use static empty sets — highlighting handled by Sigma reducers)
   const ctxValue = useMemo<GraphContextValue>(
@@ -1045,9 +1079,17 @@ export function GraphFlow(props: GraphFlowProps) {
   }, [onViewModeChange, collapseAllHubs]);
 
   const handleLayoutModeChange = useCallback((mode: LayoutMode) => {
+    // Refuse right at the click when ELK can't run: switching the mode anyway
+    // would stop the force layout and leave an active-looking toggle doing
+    // nothing (the canvas-side notice covers graphs that grow past the cap
+    // after the mode is already active).
+    if (mode === "hierarchical" && sigmaGraph && sigmaGraph.order > ELK_MAX_NODES) {
+      setLayoutNotice(elkSkipReason(sigmaGraph.order));
+      return;
+    }
     setLayoutMode(mode);
     setLayoutNotice(null);
-  }, []);
+  }, [sigmaGraph]);
 
   const handleGraphThemeChange = useCallback(
     (theme: GraphTheme) => {
