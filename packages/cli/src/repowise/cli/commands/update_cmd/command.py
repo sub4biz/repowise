@@ -376,6 +376,11 @@ def run_update(
                 "--full is single-repo only. Run it inside a specific repo "
                 "(or pass --no-workspace / --repo <alias>)."
             )
+        if docs_flag:
+            console.print(
+                "[yellow]--docs is not supported in workspace mode yet; run it per repo, "
+                "e.g. repowise update --docs --no-workspace from inside the repo.[/yellow]"
+            )
         try:
             _workspace_update(target, dry_run=dry_run, agents_md=agents_md, verbose=verbose)
         except Exception as exc:
@@ -457,12 +462,12 @@ def run_update(
 
     load_dotenv(repo_path)
     state = load_state(repo_path)
-    from repowise.cli.commands.update_cmd.mode import _resolve_index_only_mode
     resolved_index_only = _resolve_index_only_mode(
         index_only=index_only, docs_flag=docs_flag, state=state
     )
     base_ref = since or (
-        state.get("last_sync_commit") if resolved_index_only
+        state.get("last_sync_commit")
+        if resolved_index_only
         else state.get("last_docs_commit", state.get("last_sync_commit"))
     )
     head = get_head_commit(repo_path)
@@ -617,10 +622,14 @@ def run_update(
 
     if not file_diffs and not config_changed:
         console.print("[green]No changed files detected.[/green]")
-        save_state(
-            repo_path,
-            {**state, "last_sync_commit": head, "config_fingerprint": curr_config_fp},
-        )
+        # Always advance the sync pointer so the on-disk freshness marker stays
+        # current on no-op syncs. In docs mode, no changed files means no docs
+        # work is pending, so the docs pointer can advance to head too, which
+        # also heals legacy state that never recorded one.
+        persisted = {**state, "last_sync_commit": head, "config_fingerprint": curr_config_fp}
+        if not resolved_index_only and head:
+            persisted["last_docs_commit"] = head
+        save_state(repo_path, persisted)
         # Keep the DB freshness stamp in lockstep with state.json: the server's
         # /repos endpoint reads head_commit from the row, not the state file.
         stamp_head_commit(repo_path, head)
